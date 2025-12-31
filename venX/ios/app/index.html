@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>VenX iOS Bridge</title>
+    <!-- Import the core VenX library from the shared JS folder -->
+    <script src="../../js/venX.js"></script>
+    <style>
+        /* The bridge is invisible; it only runs the logic in the background */
+        body { 
+            margin: 0; 
+            padding: 0; 
+            background: transparent; 
+            overflow: hidden; 
+            
+            /* Prevent user selection to make it feel like a native app */
+            -webkit-user-select: none; /* Safari/Chrome/iOS */
+            -moz-user-select: none;    /* Firefox */
+            -ms-user-select: none;     /* IE/Edge */
+            user-select: none;         /* Standard */
+        }
+    </style>
+</head>
+<body>
+    <!-- This executes the developer's UI logic -->
+    <script src="main.js"></script>
+</body>
+</html>

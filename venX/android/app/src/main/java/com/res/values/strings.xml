@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The name of your application as it appears on the launcher -->
+    <string name="app_name">VenX</string>
+
+    <!-- Accessibility descriptions for the bridge -->
+    <string name="loading_engine">Initializing VenX Native Engine...</string>
+    
+    <!-- Error messages -->
+    <string name="bridge_error">VenX Bridge Error: Native environment not detected.</string>
+</resources>
