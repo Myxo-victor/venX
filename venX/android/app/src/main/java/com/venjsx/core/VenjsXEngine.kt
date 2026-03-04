@@ -1357,7 +1357,11 @@ class VenjsXEngine(
 
   private fun parseBorderColor(border: String): Int {
     if (border.isBlank()) return Color.TRANSPARENT
-    val tokens = border.split(Regex("\\s+")).filter { it.isNotBlank() }
+    val tokens = Regex("""(?i)(rgba?\([^)]*\)|#[0-9a-f]{3,8}|[a-z]+)""")
+      .findAll(border)
+      .map { it.value.trim() }
+      .filter { it.isNotBlank() }
+      .toList()
     for (i in tokens.indices.reversed()) {
       val token = tokens[i]
       val parsed = parseColor(token)

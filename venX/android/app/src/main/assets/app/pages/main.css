@@ -1,0 +1,50 @@
+.app-container {
+  padding: 20px;
+  background-color: #ffffff;
+}
+
+.app-title {
+  font-size: 24px;
+  font-weight: bold;
+  color: #111827;
+  margin-bottom: 8px;
+}
+
+.app-subtitle {
+  font-size: 16px;
+  color: #374151;
+  margin-bottom: 12px;
+}
+
+.app-input {
+  width: 100%;
+  height: 40px;
+  padding: 10px;
+  background-color: white;
+  border: 1px solid rgb(238 ,233 , 233);
+  color: rgb(31, 30, 30);
+  font-family: myfont;/*official venjsX font*/
+  margin: 10px auto;
+  border-radius: 10px;
+  font-size: 14px;
+}
+
+.app-image {
+  width: 100%;
+  height: 160px;
+  border-radius: 10px;
+  margin-bottom: 12px;
+}
+
+.app-spinner {
+  margin-bottom: 12px;
+}
+
+.app-button {
+  background-color: #2563eb;
+  color: #ffffff;
+  border-radius: 12px;
+  padding: 14px;
+  text-align: center;
+}
+

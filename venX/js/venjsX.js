@@ -327,11 +327,15 @@ const venjs = {
     const events = {};
     const sourceEvents = props.events && typeof props.events === 'object' ? props.events : {};
 
-    if (typeof props.onClick === 'function') {
-      events.click = venjs._registerEventHandler(props.onClick);
-    }
-    if (typeof props.onPress === 'function') {
-      events.click = venjs._registerEventHandler(props.onPress);
+    const clickHandler = typeof props.onClick === 'function'
+      ? props.onClick
+      : typeof props.onclick === 'function'
+        ? props.onclick
+        : typeof props.onPress === 'function'
+          ? props.onPress
+          : null;
+    if (clickHandler) {
+      events.click = venjs._registerEventHandler(clickHandler);
     }
     if (typeof props.onChange === 'function') {
       events.change = venjs._registerEventHandler(props.onChange);
@@ -346,6 +350,7 @@ const venjs = {
     });
 
     delete props.onClick;
+    delete props.onclick;
     delete props.onPress;
     delete props.onChange;
     delete props.events;
