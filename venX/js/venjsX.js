@@ -451,6 +451,7 @@ const venjs = {
   icon: (...args) => venjs.createElement('icon', ...args),
   activityIndicator: (...args) => venjs.createElement('activityIndicator', ...args),
   a: (...args) => venjs.createElement('a', ...args),
+  select: (...args) => venjs.createElement('select', ...args),
   openExternalURL: (url) => {
     const target = typeof url === 'string' ? url.trim() : '';
     if (!target) return;

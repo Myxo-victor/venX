@@ -82,25 +82,43 @@ class VenjsXEngine: NSObject, WKScriptMessageHandler, WKUIDelegate {
       }
       view = field
     case "select":
-      let field = UITextField()
-      field.borderStyle = .roundedRect
-      field.isUserInteractionEnabled = false
-      field.text = props["value"] as? String
-      if let children = node["children"] as? [[String: Any]],
-         let firstOption = children.first,
-         let firstProps = firstOption["props"] as? [String: Any] {
-        field.placeholder = firstProps["textContent"] as? String
-      } else {
-        field.placeholder = props["placeholder"] as? String
+      let button = UIButton(type: .system)
+      button.layer.borderWidth = 1
+      button.layer.borderColor = UIColor.systemGray4.cgColor
+      button.layer.cornerRadius = 5
+      button.backgroundColor = .white
+      button.contentHorizontalAlignment = .left
+      button.contentEdgeInsets = UIEdgeInsets(top: 0, left: 10, bottom: 0, right: 10)
+      
+      var options: [(label: String, value: String)] = []
+      if let children = node["children"] as? [[String: Any]] {
+        for child in children {
+          if let childProps = child["props"] as? [String: Any],
+             let textContent = childProps["textContent"] as? String {
+            let value = childProps["value"] as? String ?? textContent
+            options.append((label: textContent, value: value))
+          }
+        }
       }
+      
+      let selectedValue = props["value"] as? String ?? ""
+      let selectedOption = options.first(where: { $0.value == selectedValue }) ?? options.first
+      button.setTitle(selectedOption?.label ?? props["placeholder"] as? String ?? "Select", for: .normal)
+      
       if let colorHex = style["color"] as? String {
-        field.textColor = parseColor(colorHex)
+        button.setTitleColor(parseColor(colorHex), for: .normal)
       }
       if let size = style["fontSize"] {
         let fontSize = CGFloat(styleInt(["fontSize": size], "fontSize", defaultValue: 16))
-        field.font = .systemFont(ofSize: fontSize)
+        button.titleLabel?.font = .systemFont(ofSize: fontSize)
       }
-      view = field
+      
+      // Store options and props for later use in tap handler
+      button.accessibilityIdentifier = selectedValue
+      button.accessibilityLabel = options.map { $0.value }.joined(separator: ",")
+      button.accessibilityHint = options.map { $0.label }.joined(separator: "|")
+      
+      view = button
     case "image":
       let imageView = UIImageView()
       imageView.clipsToBounds = true
@@ -174,10 +192,36 @@ class VenjsXEngine: NSObject, WKScriptMessageHandler, WKUIDelegate {
     if mapped["change"] != nil, let input = view as? UITextField {
       input.addTarget(self, action: #selector(handleInputChange(_:)), for: .editingChanged)
     }
+    
+    if mapped["change"] != nil, tag == "select", let button = view as? UIButton {
+      button.addTarget(self, action: #selector(handleSelectTap(_:)), for: .touchUpInside)
+    }
   }
 
   @objc private func handleButtonTap(_ sender: UIButton) {
     emitEvent(for: sender, eventName: "click", tag: "button", extra: [:])
+  }
+
+  @objc private func handleSelectTap(_ sender: UIButton) {
+    guard let labels = sender.accessibilityHint?.split(separator: "|").map(String.init),
+          let values = sender.accessibilityLabel?.split(separator: ",").map(String.init),
+          labels.count == values.count else { return }
+    
+    let alert = UIAlertController(title: nil, message: nil, preferredStyle: .actionSheet)
+    for (index, label) in labels.enumerated() {
+      let action = UIAlertAction(title: label, style: .default) { _ in
+        sender.setTitle(label, for: .normal)
+        sender.accessibilityIdentifier = values[index]
+        self.emitEvent(for: sender, eventName: "change", tag: "select", extra: ["value": values[index]])
+      }
+      alert.addAction(action)
+    }
+    let cancel = UIAlertAction(title: "Cancel", style: .cancel, handler: nil)
+    alert.addAction(cancel)
+    
+    if let controller = rootViewController {
+      controller.present(alert, animated: true, completion: nil)
+    }
   }
 
   @objc private func handleViewTap(_ recognizer: UITapGestureRecognizer) {
