@@ -12,6 +12,8 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
+import android.os.Handler
+import android.os.Looper
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
 import com.venjsx.core.VenjsXEngine
@@ -19,6 +21,12 @@ import com.venjsx.core.VenjsXEngine
 class MainActivity : AppCompatActivity() {
   private var bridgeWebView: WebView? = null
   private var nativeRoot: FrameLayout? = null
+  private var venjsXEngine: VenjsXEngine? = null
+
+  private val assetUrl = "file:///android_asset/app/index.html"
+  private val devUrl = "http://10.0.2.2:5173/index.html"
+  private var attemptedDevUrl = false
+  private var devPageLoaded = false
 
   override fun onCreate(savedInstanceState: Bundle?) {
     // Drop launch/splash theme immediately so it doesn't linger while JS boots.
@@ -52,8 +60,27 @@ class MainActivity : AppCompatActivity() {
     }
 
     configureBridgeWebView(bridgeWebView!!)
-    bridgeWebView!!.addJavascriptInterface(VenjsXEngine(this, nativeRoot!!, bridgeWebView!!), "Android")
-    bridgeWebView!!.loadUrl("file:///android_asset/app/index.html")
+    venjsXEngine = VenjsXEngine(this, nativeRoot!!, bridgeWebView!!)
+    bridgeWebView!!.addJavascriptInterface(venjsXEngine!!, "Android")
+    venjsXEngine?.handleNotificationTapFromIntent(intent)
+
+    // Only attempt dev server on emulators. Physical devices cannot reach 10.0.2.2.
+    if (BuildConfig.DEBUG && isProbablyEmulator()) {
+      attemptedDevUrl = true
+      devPageLoaded = false
+      bridgeWebView!!.loadUrl(devUrl)
+
+      // Extra safety: if dev server doesn't load quickly, fall back to packaged assets.
+      Handler(Looper.getMainLooper()).postDelayed({
+        val webView = bridgeWebView ?: return@postDelayed
+        if (attemptedDevUrl && !devPageLoaded) {
+          attemptedDevUrl = false
+          webView.loadUrl(assetUrl)
+        }
+      }, 1500)
+    } else {
+      bridgeWebView!!.loadUrl(assetUrl)
+    }
 
     appHost.addView(nativeRoot)
     appHost.addView(bridgeWebView)
@@ -101,7 +128,41 @@ class MainActivity : AppCompatActivity() {
       settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
     }
 
-    webView.webViewClient = WebViewClient()
+    webView.webViewClient = object : WebViewClient() {
+      override fun onPageFinished(view: WebView, url: String) {
+        super.onPageFinished(view, url)
+        if (attemptedDevUrl && url.startsWith(devUrl)) {
+          devPageLoaded = true
+        }
+      }
+
+      @Deprecated("Deprecated in Java")
+      override fun onReceivedError(
+        view: WebView,
+        errorCode: Int,
+        description: String?,
+        failingUrl: String?
+      ) {
+        super.onReceivedError(view, errorCode, description, failingUrl)
+        if (attemptedDevUrl && failingUrl != null && failingUrl.startsWith(devUrl)) {
+          attemptedDevUrl = false
+          view.loadUrl(assetUrl)
+        }
+      }
+
+      override fun onReceivedError(
+        view: WebView,
+        request: android.webkit.WebResourceRequest,
+        error: android.webkit.WebResourceError
+      ) {
+        super.onReceivedError(view, request, error)
+        val url = request.url?.toString() ?: ""
+        if (attemptedDevUrl && request.isForMainFrame && url.startsWith(devUrl)) {
+          attemptedDevUrl = false
+          view.loadUrl(assetUrl)
+        }
+      }
+    }
     webView.webChromeClient = object : WebChromeClient() {
       override fun onJsAlert(
         view: WebView?,
@@ -128,6 +189,25 @@ class MainActivity : AppCompatActivity() {
     webView.clearFormData()
   }
 
+  private fun isProbablyEmulator(): Boolean {
+    val fingerprint = Build.FINGERPRINT.lowercase()
+    val model = Build.MODEL.lowercase()
+    val brand = Build.BRAND.lowercase()
+    val device = Build.DEVICE.lowercase()
+    val product = Build.PRODUCT.lowercase()
+
+    return fingerprint.contains("generic") ||
+      fingerprint.contains("unknown") ||
+      model.contains("google_sdk") ||
+      model.contains("emulator") ||
+      model.contains("android sdk built for") ||
+      brand.contains("generic") ||
+      device.contains("generic") ||
+      product.contains("sdk") ||
+      product.contains("emulator") ||
+      product.contains("simulator")
+  }
+
   override fun onDestroy() {
     bridgeWebView?.let {
       it.removeJavascriptInterface("Android")
@@ -135,6 +215,22 @@ class MainActivity : AppCompatActivity() {
     }
     bridgeWebView = null
     nativeRoot = null
+    venjsXEngine = null
     super.onDestroy()
+  }
+
+  override fun onNewIntent(intent: android.content.Intent) {
+    super.onNewIntent(intent)
+    setIntent(intent)
+    venjsXEngine?.handleNotificationTapFromIntent(intent)
+  }
+
+  override fun onRequestPermissionsResult(
+    requestCode: Int,
+    permissions: Array<out String>,
+    grantResults: IntArray
+  ) {
+    venjsXEngine?.onRequestPermissionsResult(requestCode, permissions, grantResults)
+    super.onRequestPermissionsResult(requestCode, permissions, grantResults)
   }
 }

@@ -3,6 +3,13 @@ plugins {
   id 'org.jetbrains.kotlin.android'
 }
 
+def hasGoogleServices = file('google-services.json').exists()
+if (hasGoogleServices) {
+  apply plugin: 'com.google.gms.google-services'
+} else {
+  println("venjsX: google-services.json not found; skipping Google Services plugin (FCM push disabled).")
+}
+
 android {
   namespace 'com.venjsx'
   compileSdk 34
@@ -37,6 +44,10 @@ android {
   kotlinOptions {
     jvmTarget = '1.8'
   }
+
+  buildFeatures {
+    buildConfig true
+  }
 }
 
 tasks.withType(JavaCompile) {
@@ -45,5 +56,8 @@ tasks.withType(JavaCompile) {
 
 dependencies {
   implementation 'androidx.appcompat:appcompat:1.6.1'
+  implementation 'androidx.core:core:1.13.1'
   implementation 'androidx.webkit:webkit:1.8.0'
+  implementation platform('com.google.firebase:firebase-bom:33.6.0')
+  implementation 'com.google.firebase:firebase-messaging'
 }

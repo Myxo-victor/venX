@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>venjsX Dev</title>
+  <script src="/venjsX.js"></script>
+  <style>
+    body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
+  </style>
+</head>
+<body>
+  <script>
+    (function () {
+      try {
+        var wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/__venjsx_ws';
+        var ws = new WebSocket(wsUrl);
+        ws.onmessage = function (ev) {
+          if (String(ev.data || '') === 'reload') {
+            location.reload();
+          }
+        };
+      } catch (e) {}
+    })();
+  </script>
+  <script src="/bundle.js"></script>
+</body>
+</html>
+

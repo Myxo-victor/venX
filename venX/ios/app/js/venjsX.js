@@ -7,12 +7,17 @@ const venjs = {
   _eventHandlers: {},
   _eventHandlerIds: new WeakMap(),
   _eventIdSeed: 1,
+  _persistentEventHandlers: {},
+  _persistentEventIdSeed: 1000000,
+  _plugins: [],
+  _pluginNames: new Set(),
   _rootComponent: null,
   _errorHandler: null,
   _nativeEventContext: null,
   _styleRules: [],
   _styleRegistryReady: false,
   _styleReloadWatchInstalled: false,
+  _nativeLoggingInstalled: false,
   _ANIM_TEXT_TAGS: { text: true, button: true, a: true },
   _FA_ICONS: {
     check: '\uf00c',
@@ -45,6 +50,12 @@ const venjs = {
     return id;
   },
 
+  _registerPersistentEventHandler: (handler) => {
+    const id = venjs._persistentEventIdSeed++;
+    venjs._persistentEventHandlers[id] = handler;
+    return id;
+  },
+
   _resetEventRegistry: () => {
     venjs._eventHandlers = {};
     venjs._eventHandlerIds = new WeakMap();
@@ -52,7 +63,7 @@ const venjs = {
   },
 
   _dispatchEvent: (eventId, payload) => {
-    const handler = venjs._eventHandlers[eventId];
+    const handler = venjs._eventHandlers[eventId] || venjs._persistentEventHandlers[eventId];
     if (typeof handler !== 'function') {
       console.warn(`venjsX: No handler found for event id ${eventId}.`);
       return;
@@ -327,14 +338,29 @@ const venjs = {
     const events = {};
     const sourceEvents = props.events && typeof props.events === 'object' ? props.events : {};
 
-    if (typeof props.onClick === 'function') {
-      events.click = venjs._registerEventHandler(props.onClick);
-    }
-    if (typeof props.onPress === 'function') {
-      events.click = venjs._registerEventHandler(props.onPress);
+    const clickHandler = typeof props.onClick === 'function'
+      ? props.onClick
+      : typeof props.onclick === 'function'
+        ? props.onclick
+        : typeof props.onPress === 'function'
+          ? props.onPress
+          : null;
+    if (clickHandler) {
+      events.click = venjs._registerEventHandler(clickHandler);
     }
     if (typeof props.onChange === 'function') {
       events.change = venjs._registerEventHandler(props.onChange);
+    }
+
+    const doubleTapHandler = typeof props.onDoubleTap === 'function'
+      ? props.onDoubleTap
+      : typeof props.onDoubleClick === 'function'
+        ? props.onDoubleClick
+        : typeof props.onDblClick === 'function'
+          ? props.onDblClick
+          : null;
+    if (doubleTapHandler) {
+      events.doubleTap = venjs._registerEventHandler(doubleTapHandler);
     }
 
     Object.keys(sourceEvents).forEach((name) => {
@@ -346,8 +372,12 @@ const venjs = {
     });
 
     delete props.onClick;
+    delete props.onclick;
     delete props.onPress;
     delete props.onChange;
+    delete props.onDoubleTap;
+    delete props.onDoubleClick;
+    delete props.onDblClick;
     delete props.events;
     if (Object.keys(events).length > 0) {
       props.events = events;
@@ -446,6 +476,7 @@ const venjs = {
   icon: (...args) => venjs.createElement('icon', ...args),
   activityIndicator: (...args) => venjs.createElement('activityIndicator', ...args),
   a: (...args) => venjs.createElement('a', ...args),
+  select: (...args) => venjs.createElement('select', ...args),
   openExternalURL: (url) => {
     const target = typeof url === 'string' ? url.trim() : '';
     if (!target) return;
@@ -463,6 +494,203 @@ const venjs = {
     if (typeof window.open === 'function') {
       window.open(target, '_blank');
     }
+  },
+
+  _sendDeviceRequest: (payload) => {
+    const json = JSON.stringify(payload);
+
+    if (window.Android && typeof window.Android.deviceRequest === 'function') {
+      window.Android.deviceRequest(json);
+      return true;
+    }
+
+    if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.deviceRequest) {
+      window.webkit.messageHandlers.deviceRequest.postMessage(json);
+      return true;
+    }
+
+    return false;
+  },
+
+  _deviceRequest: (action, params = {}) => new Promise((resolve, reject) => {
+    if (!action || typeof action !== 'string') {
+      reject(new Error('venjsX: device request requires an action string.'));
+      return;
+    }
+
+    let eventId = 0;
+    eventId = venjs._registerPersistentEventHandler((payload) => {
+      delete venjs._persistentEventHandlers[eventId];
+      if (payload && payload.ok === false) {
+        const err = new Error(payload.error || `venjsX: ${action} failed.`);
+        err.code = payload.code || 'E_DEVICE';
+        reject(err);
+        return;
+      }
+      resolve(payload);
+    });
+
+    const requestPayload = {
+      type: 'device',
+      action,
+      eventId,
+      params: params && typeof params === 'object' ? params : {}
+    };
+
+    if (!venjs._sendDeviceRequest(requestPayload)) {
+      delete venjs._persistentEventHandlers[eventId];
+      reject(new Error('venjsX: no native device bridge detected.'));
+    }
+  }),
+
+  createFile: (spec = {}) => venjs._deviceRequest('createFile', spec),
+  listFiles: (spec = {}) => venjs._deviceRequest('listFiles', spec),
+  readFile: (spec = {}) => venjs._deviceRequest('readFile', spec),
+  writeFile: (spec = {}) => venjs._deviceRequest('writeFile', spec),
+  getLocation: (spec = {}) => venjs._deviceRequest('getLocation', spec),
+
+  onShake: (handler, spec = {}) => {
+    if (typeof handler !== 'function') {
+      throw new Error('venjsX.onShake requires a function.');
+    }
+
+    const eventId = venjs._registerPersistentEventHandler((payload) => {
+      try {
+        handler(payload || {});
+      } catch (err) {
+        console.error('venjsX: Error in onShake handler.', err);
+      }
+    });
+
+    const startPayload = { type: 'device', action: 'startShake', eventId, params: spec || {} };
+    if (!venjs._sendDeviceRequest(startPayload)) {
+      delete venjs._persistentEventHandlers[eventId];
+      throw new Error('venjsX: no native device bridge detected.');
+    }
+
+    return () => {
+      delete venjs._persistentEventHandlers[eventId];
+      venjs._sendDeviceRequest({ type: 'device', action: 'stopShake', eventId, params: {} });
+    };
+  },
+
+  _subscribeNotificationListener: (kind, handler) => {
+    if (typeof handler !== 'function') {
+      throw new Error('venjsX.notifications listener requires a function.');
+    }
+    const normalizedKind = String(kind || '').trim();
+    if (!normalizedKind) {
+      throw new Error('venjsX.notifications listener requires a kind.');
+    }
+
+    const eventId = venjs._registerPersistentEventHandler((payload) => {
+      try {
+        handler(payload || {});
+      } catch (err) {
+        console.error('venjsX: Error in notifications handler.', err);
+      }
+    });
+
+    const startPayload = {
+      type: 'device',
+      action: 'startNotificationListener',
+      eventId,
+      params: { kind: normalizedKind }
+    };
+    if (!venjs._sendDeviceRequest(startPayload)) {
+      delete venjs._persistentEventHandlers[eventId];
+      throw new Error('venjsX: no native device bridge detected.');
+    }
+
+    return () => {
+      delete venjs._persistentEventHandlers[eventId];
+      venjs._sendDeviceRequest({
+        type: 'device',
+        action: 'stopNotificationListener',
+        eventId,
+        params: { kind: normalizedKind }
+      });
+    };
+  },
+
+  notifications: {
+    requestPermission: (spec = {}) => venjs._deviceRequest('requestNotificationPermission', spec),
+    scheduleLocal: (spec = {}) => venjs._deviceRequest('scheduleLocalNotification', spec),
+    cancelLocal: (spec = {}) => venjs._deviceRequest('cancelLocalNotification', spec),
+    getPushToken: (spec = {}) => venjs._deviceRequest('getPushToken', spec),
+    onReceive: (handler) => venjs._subscribeNotificationListener('receive', handler),
+    onTap: (handler) => venjs._subscribeNotificationListener('tap', handler)
+  },
+
+  use: (plugin, options = {}) => {
+    const target = plugin && typeof plugin === 'object'
+      ? plugin
+      : typeof plugin === 'function'
+        ? { install: plugin }
+        : null;
+
+    if (!target || typeof target.install !== 'function') {
+      throw new Error('venjsX.use requires a plugin with an install(venjs, options) function.');
+    }
+
+    const name = target.name ? String(target.name).trim() : '';
+    if (name && venjs._pluginNames.has(name)) {
+      return;
+    }
+
+    target.install(venjs, options || {});
+    venjs._plugins.push(target);
+    if (name) {
+      venjs._pluginNames.add(name);
+    }
+  },
+
+  enableNativeLogging: () => {
+    if (venjs._nativeLoggingInstalled) {
+      return () => {};
+    }
+    venjs._nativeLoggingInstalled = true;
+
+    const levels = ['log', 'info', 'warn', 'error'];
+    const originals = {};
+
+    const toMessage = (args) => args
+      .map((item) => {
+        if (typeof item === 'string') return item;
+        try {
+          return JSON.stringify(item);
+        } catch (_err) {
+          return String(item);
+        }
+      })
+      .join(' ');
+
+    levels.forEach((level) => {
+      originals[level] = typeof console[level] === 'function' ? console[level].bind(console) : null;
+      console[level] = (...args) => {
+        try {
+          venjs._sendDeviceRequest({
+            type: 'device',
+            action: 'log',
+            eventId: 0,
+            params: { level, message: toMessage(args) }
+          });
+        } catch (_err) {
+        }
+        if (originals[level]) {
+          originals[level](...args);
+        }
+      };
+    });
+
+    return () => {
+      levels.forEach((level) => {
+        if (originals[level]) {
+          console[level] = originals[level];
+        }
+      });
+      venjs._nativeLoggingInstalled = false;
+    };
   },
 
   api: {

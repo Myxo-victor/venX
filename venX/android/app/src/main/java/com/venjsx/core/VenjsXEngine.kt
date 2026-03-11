@@ -1,23 +1,36 @@
 package com.venjsx.core
 
 import android.app.Activity
+import android.app.AlarmManager
 import android.app.DatePickerDialog
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Outline
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.location.Criteria
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
+import android.Manifest
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
 import android.util.LruCache
+import android.util.Log
 import android.util.TypedValue
+import android.view.GestureDetector
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -38,9 +51,16 @@ import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.FrameLayout
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import androidx.core.content.res.ResourcesCompat
+import com.google.firebase.messaging.FirebaseMessaging
+import com.venjsx.notifications.VenjsXLocalNotificationReceiver
+import com.venjsx.notifications.VenjsXPushTokenStore
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
+import java.nio.charset.Charset
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Calendar
@@ -56,7 +76,18 @@ class VenjsXEngine(
 ) {
   companion object {
     private const val ANIM_SIGNATURE_TAG_KEY = 0x7F0B1001
+    private const val DOUBLE_TAP_DETECTOR_TAG_KEY = 0x7F0B1002
+    private const val SHAKE_SENSOR_LISTENER_TAG_KEY = 0x7F0B1003
+    private const val LOCATION_PERMISSION_REQUEST_CODE = 0x5127
+    private const val NOTIFICATIONS_PERMISSION_REQUEST_CODE = 0x5128
     private const val USE_RECONCILIATION = false
+
+    @Volatile
+    var activeEngine: VenjsXEngine? = null
+  }
+
+  init {
+    activeEngine = this
   }
 
   private data class VNode(
@@ -78,6 +109,23 @@ class VenjsXEngine(
   private var mountedScrollView: ScrollView? = null
   private var mountedRootView: View? = null
   private var previousTree: VNode? = null
+
+  private data class PendingLocationRequest(
+    val eventId: Int,
+    val params: JSONObject
+  )
+
+  private var pendingLocationRequest: PendingLocationRequest? = null
+  private var pendingNotificationsPermissionEventId: Int? = null
+
+  private val shakeListenerEventIds = mutableSetOf<Int>()
+  private var shakeSensorInstalled = false
+  private var lastShakeTimestampMs = 0L
+
+  private val notificationReceiveListenerEventIds = mutableSetOf<Int>()
+  private val notificationTapListenerEventIds = mutableSetOf<Int>()
+  private var pendingNotificationTapPayload: JSONObject? = null
+  private val pendingNotificationReceivePayloads = mutableListOf<JSONObject>()
   private val defaultTypeface: Typeface? by lazy { loadFontByNames(listOf("myfont", "ibm_plex_sans")) }
   private val fontAwesomeTypeface: Typeface? by lazy {
     loadFontByNames(
@@ -142,6 +190,678 @@ class VenjsXEngine(
     } catch (e: Exception) {
       e.printStackTrace()
     }
+  }
+
+  @JavascriptInterface
+  fun deviceRequest(json: String) {
+    val payload = try {
+      JSONObject(json)
+    } catch (_: Exception) {
+      return
+    }
+
+    val action = payload.optString("action", "").trim()
+    val eventId = payload.optInt("eventId", -1)
+    val params = payload.optJSONObject("params") ?: JSONObject()
+    if (action.isBlank()) return
+
+    if (action == "log") {
+      handleNativeLog(params)
+      return
+    }
+
+    if (eventId <= 0) return
+
+    when (action) {
+      "createFile" -> handleCreateFile(eventId, params)
+      "listFiles" -> handleListFiles(eventId)
+      "readFile" -> handleReadFile(eventId, params)
+      "writeFile" -> handleWriteFile(eventId, params)
+      "getLocation" -> handleGetLocation(eventId, params)
+      "startShake" -> handleStartShake(eventId)
+      "stopShake" -> handleStopShake(eventId)
+      "requestNotificationPermission" -> handleRequestNotificationsPermission(eventId)
+      "scheduleLocalNotification" -> handleScheduleLocalNotification(eventId, params)
+      "cancelLocalNotification" -> handleCancelLocalNotification(eventId, params)
+      "startNotificationListener" -> handleStartNotificationListener(eventId, params)
+      "stopNotificationListener" -> handleStopNotificationListener(eventId, params)
+      "getPushToken" -> handleGetPushToken(eventId)
+      else -> emitDeviceError(eventId, "E_ACTION", "Unknown action: $action")
+    }
+  }
+
+  private fun handleNativeLog(params: JSONObject) {
+    val level = params.optString("level", "log").trim().lowercase()
+    val message = params.optString("message", "")
+    when (level) {
+      "error" -> Log.e("venjsX", message)
+      "warn", "warning" -> Log.w("venjsX", message)
+      "info" -> Log.i("venjsX", message)
+      "debug" -> Log.d("venjsX", message)
+      else -> Log.d("venjsX", message)
+    }
+  }
+
+  fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+    if (requestCode == LOCATION_PERMISSION_REQUEST_CODE) {
+      val pending = pendingLocationRequest ?: return
+      pendingLocationRequest = null
+
+      val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+      if (!granted) {
+        emitDeviceError(pending.eventId, "E_PERMISSION", "Location permission denied.")
+        return
+      }
+
+      requestSingleLocationUpdate(pending.eventId, pending.params)
+      return
+    }
+
+    if (requestCode == NOTIFICATIONS_PERMISSION_REQUEST_CODE) {
+      val eventId = pendingNotificationsPermissionEventId ?: return
+      pendingNotificationsPermissionEventId = null
+
+      val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+      emitDeviceOk(eventId, JSONObject().apply { put("granted", granted) })
+    }
+  }
+
+  private fun deviceRootDir(): File {
+    val base = (context.getExternalFilesDir(null) ?: context.filesDir)
+    val dir = File(base, "venjsX")
+    if (!dir.exists()) {
+      try {
+        dir.mkdirs()
+      } catch (_: Exception) {
+      }
+    }
+    return dir
+  }
+
+  private fun sanitizeFileName(raw: String): String? {
+    val name = raw.trim()
+    if (name.isBlank()) return null
+    if (name.contains("..")) return null
+    if (name.contains("/") || name.contains("\\") || name.contains("\u0000")) return null
+    return name
+  }
+
+  private fun emitDeviceOk(eventId: Int, body: JSONObject) {
+    try {
+      body.put("ok", true)
+      body.put("platform", "android")
+      body.put("timestamp", System.currentTimeMillis())
+      emitEvent(eventId, body)
+    } catch (_: Exception) {
+    }
+  }
+
+  private fun emitDeviceError(eventId: Int, code: String, message: String) {
+    try {
+      val body = JSONObject().apply {
+        put("ok", false)
+        put("code", code)
+        put("error", message)
+        put("platform", "android")
+        put("timestamp", System.currentTimeMillis())
+      }
+      emitEvent(eventId, body)
+    } catch (_: Exception) {
+    }
+  }
+
+  private fun handleCreateFile(eventId: Int, params: JSONObject) {
+    val name = sanitizeFileName(params.optString("name", ""))
+    if (name == null) {
+      emitDeviceError(eventId, "E_NAME", "Invalid file name.")
+      return
+    }
+
+    val content = params.optString("write", "")
+    val overwrite = params.optBoolean("overwrite", true)
+
+    thread(start = true) {
+      try {
+        val file = File(deviceRootDir(), name)
+        if (file.exists() && !overwrite) {
+          emitDeviceError(eventId, "E_EXISTS", "File already exists.")
+          return@thread
+        }
+        file.writeText(content, Charset.forName("UTF-8"))
+        emitDeviceOk(eventId, JSONObject().apply {
+          put("name", name)
+          put("path", file.absolutePath)
+          put("size", file.length())
+        })
+      } catch (e: Exception) {
+        emitDeviceError(eventId, "E_IO", e.message ?: "Failed to create file.")
+      }
+    }
+  }
+
+  private fun handleListFiles(eventId: Int) {
+    thread(start = true) {
+      try {
+        val dir = deviceRootDir()
+        val list = JSONArray()
+        dir.listFiles()?.sortedBy { it.name.lowercase() }?.forEach { file ->
+          if (!file.isFile) return@forEach
+          list.put(JSONObject().apply {
+            put("name", file.name)
+            put("path", file.absolutePath)
+            put("size", file.length())
+            put("lastModified", file.lastModified())
+          })
+        }
+        emitDeviceOk(eventId, JSONObject().apply {
+          put("files", list)
+          put("dir", dir.absolutePath)
+        })
+      } catch (e: Exception) {
+        emitDeviceError(eventId, "E_IO", e.message ?: "Failed to list files.")
+      }
+    }
+  }
+
+  private fun resolveTargetFile(params: JSONObject): File? {
+    val dir = deviceRootDir()
+    val name = sanitizeFileName(params.optString("name", ""))
+    if (name != null) return File(dir, name)
+
+    val rawPath = params.optString("path", "").trim()
+    if (rawPath.isBlank()) return null
+    val file = File(rawPath)
+    return try {
+      val canonicalDir = dir.canonicalFile
+      val canonicalFile = file.canonicalFile
+      if (!canonicalFile.path.startsWith(canonicalDir.path)) null else canonicalFile
+    } catch (_: Exception) {
+      null
+    }
+  }
+
+  private fun handleReadFile(eventId: Int, params: JSONObject) {
+    val file = resolveTargetFile(params)
+    if (file == null) {
+      emitDeviceError(eventId, "E_PATH", "Provide a valid { name } or { path } within the app files directory.")
+      return
+    }
+
+    thread(start = true) {
+      try {
+        if (!file.exists() || !file.isFile) {
+          emitDeviceError(eventId, "E_NOT_FOUND", "File not found.")
+          return@thread
+        }
+        val text = file.readText(Charset.forName("UTF-8"))
+        emitDeviceOk(eventId, JSONObject().apply {
+          put("name", file.name)
+          put("path", file.absolutePath)
+          put("size", file.length())
+          put("read", text)
+        })
+      } catch (e: Exception) {
+        emitDeviceError(eventId, "E_IO", e.message ?: "Failed to read file.")
+      }
+    }
+  }
+
+  private fun handleWriteFile(eventId: Int, params: JSONObject) {
+    val file = resolveTargetFile(params)
+    if (file == null) {
+      emitDeviceError(eventId, "E_PATH", "Provide a valid { name } or { path } within the app files directory.")
+      return
+    }
+
+    val content = params.optString("write", "")
+    val append = params.optBoolean("append", false)
+
+    thread(start = true) {
+      try {
+        if (!file.exists()) {
+          file.parentFile?.mkdirs()
+          file.createNewFile()
+        }
+        if (append) {
+          file.appendText(content, Charset.forName("UTF-8"))
+        } else {
+          file.writeText(content, Charset.forName("UTF-8"))
+        }
+        emitDeviceOk(eventId, JSONObject().apply {
+          put("name", file.name)
+          put("path", file.absolutePath)
+          put("size", file.length())
+        })
+      } catch (e: Exception) {
+        emitDeviceError(eventId, "E_IO", e.message ?: "Failed to write file.")
+      }
+    }
+  }
+
+  private fun handleGetLocation(eventId: Int, params: JSONObject) {
+    val activity = context as? Activity ?: run {
+      emitDeviceError(eventId, "E_CONTEXT", "No Activity context available for location.")
+      return
+    }
+
+    val permission = Manifest.permission.ACCESS_FINE_LOCATION
+    val granted = ContextCompat.checkSelfPermission(activity, permission) == PackageManager.PERMISSION_GRANTED
+    if (!granted) {
+      pendingLocationRequest = PendingLocationRequest(eventId, params)
+      ActivityCompat.requestPermissions(activity, arrayOf(permission), LOCATION_PERMISSION_REQUEST_CODE)
+      return
+    }
+
+    requestSingleLocationUpdate(eventId, params)
+  }
+
+  private fun requestSingleLocationUpdate(eventId: Int, params: JSONObject) {
+    val activity = context as? Activity ?: run {
+      emitDeviceError(eventId, "E_CONTEXT", "No Activity context available for location.")
+      return
+    }
+
+    val enableHighAccuracy = params.optBoolean("enableHighAccuracy", false)
+    val timeoutMs = params.optLong("timeoutMs", 15000L).coerceAtLeast(1000L)
+
+    val locationManager = activity.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: run {
+      emitDeviceError(eventId, "E_LOCATION", "Location manager unavailable.")
+      return
+    }
+
+    val criteria = Criteria().apply {
+      accuracy = if (enableHighAccuracy) Criteria.ACCURACY_FINE else Criteria.ACCURACY_COARSE
+      isCostAllowed = true
+    }
+
+    val provider = locationManager.getBestProvider(criteria, true)
+      ?: if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) LocationManager.NETWORK_PROVIDER else null
+      ?: if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) LocationManager.GPS_PROVIDER else null
+
+    if (provider == null) {
+      emitDeviceError(eventId, "E_LOCATION", "No location provider enabled.")
+      return
+    }
+
+    val handler = Handler(Looper.getMainLooper())
+    var done = false
+
+    val listener = object : LocationListener {
+      override fun onLocationChanged(location: Location) {
+        if (done) return
+        done = true
+        try {
+          locationManager.removeUpdates(this)
+        } catch (_: Exception) {
+        }
+        emitDeviceOk(eventId, JSONObject().apply {
+          put("provider", provider)
+          put("latitude", location.latitude)
+          put("longitude", location.longitude)
+          put("accuracy", location.accuracy.toDouble())
+          put("altitude", location.altitude)
+          put("speed", location.speed.toDouble())
+          put("bearing", location.bearing.toDouble())
+        })
+      }
+
+      override fun onProviderDisabled(provider: String) {}
+      override fun onProviderEnabled(provider: String) {}
+      override fun onStatusChanged(provider: String?, status: Int, extras: android.os.Bundle?) {}
+    }
+
+    handler.postDelayed({
+      if (done) return@postDelayed
+      done = true
+      try {
+        locationManager.removeUpdates(listener)
+      } catch (_: Exception) {
+      }
+      emitDeviceError(eventId, "E_TIMEOUT", "Timed out getting location.")
+    }, timeoutMs)
+
+    try {
+      locationManager.requestSingleUpdate(provider, listener, Looper.getMainLooper())
+    } catch (e: SecurityException) {
+      emitDeviceError(eventId, "E_PERMISSION", "Location permission not granted.")
+    } catch (e: Exception) {
+      emitDeviceError(eventId, "E_LOCATION", e.message ?: "Failed to request location.")
+    }
+  }
+
+  private fun handleStartShake(eventId: Int) {
+    shakeListenerEventIds.add(eventId)
+    if (!shakeSensorInstalled) {
+      installShakeSensor()
+    }
+  }
+
+  private fun handleStopShake(eventId: Int) {
+    shakeListenerEventIds.remove(eventId)
+    if (shakeListenerEventIds.isEmpty()) {
+      uninstallShakeSensor()
+    }
+  }
+
+  private fun installShakeSensor() {
+    if (shakeSensorInstalled) return
+    val activity = context as? Activity ?: return
+    val sensorManager = activity.getSystemService(Context.SENSOR_SERVICE) as? android.hardware.SensorManager ?: return
+    val accelerometer = sensorManager.getDefaultSensor(android.hardware.Sensor.TYPE_ACCELEROMETER) ?: return
+
+    lastShakeTimestampMs = 0L
+    val listener = object : android.hardware.SensorEventListener {
+      override fun onAccuracyChanged(sensor: android.hardware.Sensor?, accuracy: Int) {}
+
+      override fun onSensorChanged(event: android.hardware.SensorEvent?) {
+        val ev = event ?: return
+        if (ev.sensor.type != android.hardware.Sensor.TYPE_ACCELEROMETER) return
+        if (shakeListenerEventIds.isEmpty()) return
+
+        val x = ev.values.getOrNull(0) ?: return
+        val y = ev.values.getOrNull(1) ?: return
+        val z = ev.values.getOrNull(2) ?: return
+
+        val gX = x / android.hardware.SensorManager.GRAVITY_EARTH
+        val gY = y / android.hardware.SensorManager.GRAVITY_EARTH
+        val gZ = z / android.hardware.SensorManager.GRAVITY_EARTH
+
+        val gForce = kotlin.math.sqrt((gX * gX + gY * gY + gZ * gZ).toDouble()).toFloat()
+        val now = System.currentTimeMillis()
+        val minIntervalMs = 600L
+        val threshold = 2.7f
+        if (gForce > threshold && now - lastShakeTimestampMs > minIntervalMs) {
+          lastShakeTimestampMs = now
+          val payload = JSONObject().apply {
+            put("type", "shake")
+            put("platform", "android")
+            put("gForce", gForce.toDouble())
+            put("timestamp", now)
+          }
+          val targets = shakeListenerEventIds.toList()
+          targets.forEach { id ->
+            emitEvent(id, payload)
+          }
+        }
+      }
+    }
+
+    shakeSensorInstalled = true
+    sensorManager.registerListener(listener, accelerometer, android.hardware.SensorManager.SENSOR_DELAY_UI)
+
+    bridge.setTag(SHAKE_SENSOR_LISTENER_TAG_KEY, listener)
+  }
+
+  private fun uninstallShakeSensor() {
+    if (!shakeSensorInstalled) return
+    val activity = context as? Activity ?: return
+    val sensorManager = activity.getSystemService(Context.SENSOR_SERVICE) as? android.hardware.SensorManager ?: return
+    val listener = bridge.getTag(SHAKE_SENSOR_LISTENER_TAG_KEY) as? android.hardware.SensorEventListener
+    if (listener != null) {
+      try {
+        sensorManager.unregisterListener(listener)
+      } catch (_: Exception) {
+      }
+    }
+    bridge.setTag(SHAKE_SENSOR_LISTENER_TAG_KEY, null)
+    shakeSensorInstalled = false
+  }
+
+  fun handleNotificationTapFromIntent(intent: Intent?) {
+    val raw = intent?.getStringExtra("venjsx_notification_tap") ?: return
+    val payload = try {
+      JSONObject(raw)
+    } catch (_: Exception) {
+      JSONObject().apply { put("raw", raw) }
+    }
+
+    try {
+      payload.put("type", "notificationTap")
+      payload.put("platform", "android")
+      payload.put("timestamp", System.currentTimeMillis())
+    } catch (_: Exception) {
+    }
+
+    if (notificationTapListenerEventIds.isEmpty()) {
+      pendingNotificationTapPayload = payload
+      return
+    }
+
+    val targets = notificationTapListenerEventIds.toList()
+    targets.forEach { id ->
+      emitEvent(id, payload)
+    }
+  }
+
+  private fun handleRequestNotificationsPermission(eventId: Int) {
+    val activity = context as? Activity ?: run {
+      emitDeviceError(eventId, "E_CONTEXT", "No Activity context available for notifications permission.")
+      return
+    }
+
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+      emitDeviceOk(eventId, JSONObject().apply { put("granted", true) })
+      return
+    }
+
+    val permission = Manifest.permission.POST_NOTIFICATIONS
+    val granted = ContextCompat.checkSelfPermission(activity, permission) == PackageManager.PERMISSION_GRANTED
+    if (granted) {
+      emitDeviceOk(eventId, JSONObject().apply { put("granted", true) })
+      return
+    }
+
+    pendingNotificationsPermissionEventId = eventId
+    ActivityCompat.requestPermissions(activity, arrayOf(permission), NOTIFICATIONS_PERMISSION_REQUEST_CODE)
+  }
+
+  private fun handleStartNotificationListener(eventId: Int, params: JSONObject) {
+    val kind = params.optString("kind", "").trim().lowercase()
+    when (kind) {
+      "tap" -> {
+        notificationTapListenerEventIds.add(eventId)
+        pendingNotificationTapPayload?.let { payload ->
+          pendingNotificationTapPayload = null
+          emitEvent(eventId, payload)
+        }
+      }
+      "receive" -> {
+        notificationReceiveListenerEventIds.add(eventId)
+        if (pendingNotificationReceivePayloads.isNotEmpty()) {
+          val queued = pendingNotificationReceivePayloads.toList()
+          pendingNotificationReceivePayloads.clear()
+          queued.forEach { payload -> emitEvent(eventId, payload) }
+        }
+      }
+      else -> {}
+    }
+  }
+
+  private fun handleStopNotificationListener(eventId: Int, params: JSONObject) {
+    val kind = params.optString("kind", "").trim().lowercase()
+    when (kind) {
+      "tap" -> notificationTapListenerEventIds.remove(eventId)
+      "receive" -> notificationReceiveListenerEventIds.remove(eventId)
+      else -> {
+        notificationTapListenerEventIds.remove(eventId)
+        notificationReceiveListenerEventIds.remove(eventId)
+      }
+    }
+  }
+
+  private fun handleGetPushToken(eventId: Int) {
+    val existing = VenjsXPushTokenStore.getToken()
+    if (!existing.isNullOrBlank()) {
+      emitDeviceOk(eventId, JSONObject().apply { put("token", existing) })
+      return
+    }
+
+    try {
+      FirebaseMessaging.getInstance().token.addOnCompleteListener { task ->
+        if (!task.isSuccessful) {
+          emitDeviceError(eventId, "E_PUSH", task.exception?.message ?: "Failed to fetch FCM token.")
+          return@addOnCompleteListener
+        }
+        val token = task.result ?: ""
+        VenjsXPushTokenStore.setToken(token)
+        emitDeviceOk(eventId, JSONObject().apply { put("token", token) })
+      }
+    } catch (e: Exception) {
+      emitDeviceError(eventId, "E_PUSH", e.message ?: "Failed to fetch FCM token.")
+    }
+  }
+
+  fun emitPushToken(token: String) {
+    VenjsXPushTokenStore.setToken(token)
+  }
+
+  fun emitNotificationReceived(payload: JSONObject) {
+    try {
+      payload.put("type", "notificationReceive")
+      payload.put("platform", "android")
+      payload.put("timestamp", System.currentTimeMillis())
+    } catch (_: Exception) {
+    }
+
+    if (notificationReceiveListenerEventIds.isEmpty()) {
+      pendingNotificationReceivePayloads.add(payload)
+      return
+    }
+
+    val targets = notificationReceiveListenerEventIds.toList()
+    targets.forEach { id ->
+      emitEvent(id, payload)
+    }
+  }
+
+  private fun handleScheduleLocalNotification(eventId: Int, params: JSONObject) {
+    val idRaw = params.opt("id")
+    val idString = if (idRaw is String) idRaw.trim() else ""
+    val notificationId = when {
+      idRaw is Int && idRaw != 0 -> idRaw
+      idString.isNotBlank() -> idString.hashCode()
+      else -> (System.currentTimeMillis() % Int.MAX_VALUE).toInt()
+    }
+
+    val title = params.optString("title", "Notification")
+    val body = params.optString("body", "")
+    val delayMs = params.optLong("delayMs", 0L).coerceAtLeast(0L)
+    val atMs = params.optLong("atMs", 0L)
+    val triggerAtMs = if (atMs > 0) atMs else System.currentTimeMillis() + delayMs
+
+    val tapPayload = JSONObject().apply {
+      put("id", if (idString.isNotBlank()) idString else notificationId)
+      put("title", title)
+      put("body", body)
+      if (params.has("data")) {
+        put("data", params.opt("data"))
+      }
+    }
+
+    val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager
+    if (alarmManager == null) {
+      emitDeviceError(eventId, "E_NOTIFICATIONS", "Alarm manager unavailable.")
+      return
+    }
+
+    val intent = Intent(context, VenjsXLocalNotificationReceiver::class.java).apply {
+      putExtra("notificationId", notificationId)
+      putExtra("title", title)
+      putExtra("body", body)
+      putExtra("payload", tapPayload.toString())
+    }
+
+    val pending = PendingIntent.getBroadcast(
+      context,
+      notificationId,
+      intent,
+      PendingIntent.FLAG_UPDATE_CURRENT or (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0)
+    )
+
+    fun emitOk(exact: Boolean) {
+      emitDeviceOk(eventId, JSONObject().apply {
+        put("id", if (idString.isNotBlank()) idString else notificationId)
+        put("notificationId", notificationId)
+        put("scheduledAt", triggerAtMs)
+        put("exact", exact)
+      })
+    }
+
+    try {
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        if (alarmManager.canScheduleExactAlarms()) {
+          alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAtMs, pending)
+          emitOk(true)
+        } else {
+          alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAtMs, pending)
+          emitOk(false)
+        }
+        return
+      }
+
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAtMs, pending)
+        emitOk(true)
+      } else {
+        alarmManager.setExact(AlarmManager.RTC_WAKEUP, triggerAtMs, pending)
+        emitOk(true)
+      }
+    } catch (se: SecurityException) {
+      // Android 12+ requires SCHEDULE_EXACT_ALARM for exact alarms; fall back to inexact.
+      try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+          alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAtMs, pending)
+        } else {
+          alarmManager.set(AlarmManager.RTC_WAKEUP, triggerAtMs, pending)
+        }
+        emitOk(false)
+      } catch (e2: Exception) {
+        emitDeviceError(eventId, "E_NOTIFICATIONS", e2.message ?: "Failed to schedule notification.")
+      }
+    } catch (e: Exception) {
+      emitDeviceError(eventId, "E_NOTIFICATIONS", e.message ?: "Failed to schedule notification.")
+    }
+  }
+
+  private fun handleCancelLocalNotification(eventId: Int, params: JSONObject) {
+    val idRaw = params.opt("id")
+    val idString = if (idRaw is String) idRaw.trim() else ""
+    val notificationId = when {
+      idRaw is Int && idRaw != 0 -> idRaw
+      idString.isNotBlank() -> idString.hashCode()
+      else -> params.optInt("notificationId", 0)
+    }
+
+    if (notificationId == 0) {
+      emitDeviceError(eventId, "E_ID", "Provide { id } or { notificationId } to cancel.")
+      return
+    }
+
+    val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager
+    val intent = Intent(context, VenjsXLocalNotificationReceiver::class.java)
+    val pending = PendingIntent.getBroadcast(
+      context,
+      notificationId,
+      intent,
+      PendingIntent.FLAG_NO_CREATE or (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0)
+    )
+    if (alarmManager != null && pending != null) {
+      try {
+        alarmManager.cancel(pending)
+        pending.cancel()
+      } catch (_: Exception) {
+      }
+    }
+
+    val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+    try {
+      manager?.cancel(notificationId)
+    } catch (_: Exception) {
+    }
+
+    emitDeviceOk(eventId, JSONObject().apply {
+      put("notificationId", notificationId)
+    })
   }
 
   @JavascriptInterface
@@ -763,33 +1483,64 @@ class VenjsXEngine(
 
     val events = props.optJSONObject("events")
     val clickEventId = events?.optInt("click", -1) ?: -1
+    val doubleTapEventId = events?.optInt("doubleTap", -1) ?: -1
     val href = if (tag == "a") props.optString("href", "").trim() else ""
     val shouldOpenLink = href.isNotEmpty()
-    if (clickEventId <= 0 && !shouldOpenLink) {
-      view.setOnClickListener(null)
-      return
-    }
+    val shouldHandleClick = clickEventId > 0 || shouldOpenLink
 
-    view.setOnClickListener {
-      try {
-        if (shouldOpenLink) {
-          openUrlInChrome(href)
-        }
-        val payload = JSONObject().apply {
-          put("type", "click")
-          put("tag", tag)
-          put("platform", "android")
+    if (!shouldHandleClick) {
+      view.setOnClickListener(null)
+    } else {
+      view.setOnClickListener {
+        try {
           if (shouldOpenLink) {
-            put("href", href)
+            openUrlInChrome(href)
           }
-          put("timestamp", System.currentTimeMillis())
+          val payload = JSONObject().apply {
+            put("type", "click")
+            put("tag", tag)
+            put("platform", "android")
+            if (shouldOpenLink) {
+              put("href", href)
+            }
+            put("timestamp", System.currentTimeMillis())
+          }
+          if (clickEventId > 0) {
+            emitEvent(clickEventId, payload)
+          }
+        } catch (_: Exception) {
         }
-        if (clickEventId > 0) {
-          emitEvent(clickEventId, payload)
-        }
-      } catch (_: Exception) {
       }
     }
+
+    setupDoubleTapEvent(view, doubleTapEventId, tag)
+  }
+
+  private fun setupDoubleTapEvent(view: View, doubleTapEventId: Int, tag: String) {
+    if (doubleTapEventId <= 0) return
+    if (view is EditText) return
+
+    val detector = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
+      override fun onDoubleTap(e: MotionEvent): Boolean {
+        try {
+          val payload = JSONObject().apply {
+            put("type", "doubleTap")
+            put("tag", tag)
+            put("platform", "android")
+            put("timestamp", System.currentTimeMillis())
+          }
+          emitEvent(doubleTapEventId, payload)
+        } catch (_: Exception) {
+        }
+        return true
+      }
+    })
+
+    view.setOnTouchListener { _, event ->
+      detector.onTouchEvent(event)
+      false
+    }
+    view.setTag(DOUBLE_TAP_DETECTOR_TAG_KEY, detector)
   }
 
   private fun openUrlInChrome(rawUrl: String) {
